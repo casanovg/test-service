@@ -1,6 +1,7 @@
 """
 FastAPI Application - Main Entry Point
 """
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import logging
@@ -12,7 +13,7 @@ from .routes import router
 # Configure logging
 logging.basicConfig(
     level=getattr(logging, settings.LOG_LEVEL.upper()),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
@@ -23,7 +24,7 @@ app = FastAPI(
     version=settings.SERVICE_VERSION,
     docs_url="/docs",
     redoc_url="/redoc",
-    openapi_url="/openapi.json"
+    openapi_url="/openapi.json",
 )
 
 # Configure CORS
@@ -45,7 +46,7 @@ async def startup_event():
     logger.info(f"Starting {settings.SERVICE_NAME} v{settings.SERVICE_VERSION}")
     logger.info(f"Connecting to database: {settings.DB_HOST}:{settings.DB_PORT}/{settings.DB_NAME}")
     logger.info(f"Using schema: {settings.DB_SCHEMA}")
-    
+
     try:
         init_db()
         logger.info("Database initialized successfully")
@@ -68,15 +69,11 @@ async def root():
         "service": settings.SERVICE_NAME,
         "version": settings.SERVICE_VERSION,
         "status": "running",
-        "docs": "/docs"
+        "docs": "/docs",
     }
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        "app.main:app",
-        host="0.0.0.0",
-        port=settings.PORT,
-        reload=True
-    )
+
+    uvicorn.run("app.main:app", host="0.0.0.0", port=settings.PORT, reload=True)

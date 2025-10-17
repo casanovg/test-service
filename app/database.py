@@ -1,6 +1,7 @@
 """
 Database connection and session management
 """
+
 from sqlalchemy import create_engine, MetaData
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
@@ -12,9 +13,7 @@ engine = create_engine(
     pool_pre_ping=True,  # Verify connections before using
     pool_size=5,
     max_overflow=10,
-    connect_args={
-        "options": f"-csearch_path={settings.DB_SCHEMA},public"
-    }
+    connect_args={"options": f"-csearch_path={settings.DB_SCHEMA},public"},
 )
 
 # Session factory
@@ -43,11 +42,11 @@ def init_db():
     Called on application startup.
     """
     from sqlalchemy import text
-    
+
     # Create schema if not exists
     with engine.connect() as conn:
         conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {settings.DB_SCHEMA}"))
         conn.commit()
-    
+
     # Create all tables
     Base.metadata.create_all(bind=engine)

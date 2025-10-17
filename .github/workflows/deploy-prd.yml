@@ -1,0 +1,157 @@
+name: Deploy to Production (Manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      git_sha:
+        description: 'Git SHA to deploy (leave empty for latest from main)'
+        required: false
+        default: ''
+      confirm:
+        description: 'Type "DEPLOY" to confirm production deployment'
+        required: true
+
+env:
+  SERVICE_NAME: ${{ github.event.repository.name }}
+
+jobs:
+  # Validación antes de deployar
+  validate:
+    name: Validate Deployment
+    runs-on: self-hosted
+    outputs:
+      deploy_sha: ${{ steps.get_sha.outputs.sha }}
+      deploy_tag: ${{ steps.get_tag.outputs.tag }}
+    steps:
+      - name: Check confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "DEPLOY" ]; then
+            echo "❌ Confirmation required. You must type 'DEPLOY' to proceed."
+            exit 1
+          fi
+          echo "✅ Deployment confirmed"
+      
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Determine SHA to deploy
+        id: get_sha
+        run: |
+          if [ -n "${{ github.event.inputs.git_sha }}" ]; then
+            SHA="${{ github.event.inputs.git_sha }}"
+            echo "Using specified SHA: $SHA"
+          else
+            SHA=$(git rev-parse origin/main)
+            echo "Using latest SHA from main: $SHA"
+          fi
+          
+          # Validate SHA exists
+          if ! git cat-file -e $SHA^{commit} 2>/dev/null; then
+            echo "❌ Invalid SHA: $SHA"
+            exit 1
+          fi
+          
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+          echo "✅ Will deploy SHA: $SHA"
+      
+      - name: Get deployment tag
+        id: get_tag
+        run: |
+          SHA="${{ steps.get_sha.outputs.sha }}"
+          TAG="stg-$(echo $SHA | cut -c1-7)"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Deploy tag: $TAG"
+      
+      - name: Check if image exists
+        run: |
+          TAG="${{ steps.get_tag.outputs.tag }}"
+          if ! podman image exists ${SERVICE_NAME}:${TAG}; then
+            echo "❌ Image ${SERVICE_NAME}:${TAG} not found locally"
+            echo ""
+            echo "Available images:"
+            podman images | grep ${SERVICE_NAME} || echo "No ${SERVICE_NAME} images found"
+            echo ""
+            echo "Please run the CI/CD pipeline first to build this version:"
+            echo "https://github.com/${{ github.repository }}/actions"
+            exit 1
+          fi
+          echo "✅ Image ${SERVICE_NAME}:${TAG} found"
+
+  # Deploy a Producción
+  deploy-production:
+    name: Deploy to Production
+    runs-on: self-hosted
+    needs: validate
+    environment:
+      name: production
+      url: http://10.6.17.85:8000
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Deploy to production
+        env:
+          PRD_HOST: "10.6.17.85"
+        run: |
+          echo "🚀 Deploying SHA: ${{ needs.validate.outputs.deploy_sha }}"
+          echo "🏷️  Using tag: ${{ needs.validate.outputs.deploy_tag }}"
+          
+          # Save image as tar
+          podman save -o /tmp/${{ env.SERVICE_NAME }}.tar ${{ env.SERVICE_NAME }}:${{ needs.validate.outputs.deploy_tag }}
+          
+          # Copy to PRD server
+          scp -i ~/.ssh/github_actions_runner \
+            -o StrictHostKeyChecking=no \
+            /tmp/${{ env.SERVICE_NAME }}.tar \
+            netbackup@${PRD_HOST}:/tmp/
+          
+          # Load and run on PRD
+          ssh -i ~/.ssh/github_actions_runner \
+            -o StrictHostKeyChecking=no \
+            netbackup@${PRD_HOST} << 'ENDSSH'
+            # Stop old container if exists
+            podman stop ${{ env.SERVICE_NAME }} 2>/dev/null || true
+            podman rm ${{ env.SERVICE_NAME }} 2>/dev/null || true
+            
+            # Load new image
+            podman load -i /tmp/${{ env.SERVICE_NAME }}.tar
+            rm /tmp/${{ env.SERVICE_NAME }}.tar
+            
+            # Run new container
+            podman run -d \
+              --name ${{ env.SERVICE_NAME }} \
+              -p 8000:8000 \
+              -e DB_HOST=${{ secrets.DB_HOST_PRD }} \
+              -e DB_PORT=5432 \
+              -e DB_NAME=microservices \
+              -e DB_SCHEMA=${{ env.SERVICE_NAME }} \
+              -e DB_USER=microservices_user \
+              -e DB_PASSWORD=${{ secrets.DB_PASSWORD }} \
+              --restart=unless-stopped \
+              ${{ env.SERVICE_NAME }}:${{ needs.validate.outputs.deploy_tag }}
+            
+            # Wait for container to be healthy
+            sleep 5
+            podman ps | grep ${{ env.SERVICE_NAME }}
+          ENDSSH
+          
+          # Clean up local tar
+          rm /tmp/${{ env.SERVICE_NAME }}.tar
+      
+      - name: Verify deployment
+        run: |
+          echo "✅ Deployment completed!"
+          echo ""
+          echo "🔗 Production URL: http://10.6.17.85:8000"
+          echo "📊 Health check: http://10.6.17.85:8000/health"
+          echo "📚 API Docs: http://10.6.17.85:8000/docs"
+          echo ""
+          echo "🏷️  Deployed version: ${{ needs.validate.outputs.deploy_tag }}"
+          echo "📝 Git SHA: ${{ needs.validate.outputs.deploy_sha }}"
+          
+          # Final health check
+          sleep 10
+          curl -f http://10.6.17.85:8000/health || exit 1
+          echo "🎉 Production deployment verified successfully!"

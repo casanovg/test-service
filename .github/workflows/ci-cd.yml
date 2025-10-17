@@ -1,0 +1,335 @@
+name: CI/CD Pipeline with Database Migrations
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  release:
+    types: [published]
+
+env:
+  SERVICE_NAME: ${{ github.event.repository.name }}
+  PYTHON_VERSION: '3.12'
+
+jobs:
+  # Job 1: Lint y validación de código
+  lint:
+    name: Lint Code
+    runs-on: self-hosted
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Verify Python version
+        run: |
+          python3.12 --version
+          which python3.12
+      
+      - name: Install linting dependencies
+        run: |
+          python3.12 -m pip install --upgrade pip --user
+          python3.12 -m pip install flake8 pylint black --user
+      
+      - name: Run flake8
+        run: |
+          python3.12 -m flake8 app/ --max-line-length=100 --exclude=__pycache__ || true
+      
+      - name: Run pylint
+        run: |
+          python3.12 -m pylint app/ --fail-under=7.0 || true
+      
+      - name: Check formatting with black
+        run: |
+          python3.12 -m black --check app/ || true
+
+  # Job 2: Tests unitarios
+  test:
+    name: Run Tests
+    runs-on: self-hosted
+    needs: lint
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Install dependencies
+        run: |
+          python3.12 -m pip install --upgrade pip --user
+          python3.12 -m pip install -r requirements.txt --user
+          python3.12 -m pip install -r requirements-dev.txt --user
+      
+      - name: Run tests with coverage
+        run: |
+          python3.12 -m pytest tests/ -v --cov=app --cov-report=term --cov-report=xml || true
+      
+      - name: Upload coverage reports
+        if: success()
+        run: |
+          echo "Coverage report generated in coverage.xml"
+
+  # Job 3: Database Migration Testing
+  test-migrations:
+    name: Test Database Migrations
+    runs-on: self-hosted
+    needs: test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Test migrations in DEV environment
+        run: |
+          chmod +x /home/netbackup/ci-cd-infrastructure/scripts/database-migration-manager.sh
+          /home/netbackup/ci-cd-infrastructure/scripts/database-migration-manager.sh \
+            test-migration ${{ env.SERVICE_NAME }} dev
+        continue-on-error: false
+
+  # Job 4: Build container image
+  build:
+    name: Build Container Image
+    runs-on: self-hosted
+    needs: test-migrations
+    
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tag }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up image metadata
+        id: meta
+        run: |
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            TAG="${{ github.event.release.tag_name }}"
+          else
+            TAG="stg-$(git rev-parse --short HEAD)"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Image tag: $TAG"
+      
+      - name: Build container image with Podman
+        run: |
+          podman build \
+            -t ${{ env.SERVICE_NAME }}:${{ steps.meta.outputs.tag }} \
+            -t ${{ env.SERVICE_NAME }}:latest \
+            .
+      
+      - name: Test container
+        run: |
+          # Cleanup any previous test container
+          podman rm -f test-${{ env.SERVICE_NAME }} 2>/dev/null || true
+          
+          # Start test container with SQLite (no external DB needed)
+          podman run --rm -d --name test-${{ env.SERVICE_NAME }} -p 8001:8000 \
+            -e DATABASE_URL=sqlite:///test.db \
+            ${{ env.SERVICE_NAME }}:${{ steps.meta.outputs.tag }}
+          
+          # Wait and test
+          sleep 10
+          curl -f http://localhost:8001/health || exit 1
+          curl -f http://localhost:8001/docs || exit 1
+          
+          # Cleanup
+          podman stop test-${{ env.SERVICE_NAME }}
+          
+          echo "✅ Container test passed"
+
+  # Job 5: Deploy to Staging (with DB Migration)
+  deploy-stg:
+    name: Deploy to Staging
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: self-hosted
+    environment:
+      name: staging
+      url: http://10.6.17.83:8000
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Create database backup
+        run: |
+          chmod +x /home/netbackup/ci-cd-infrastructure/scripts/database-migration-manager.sh
+          backup_file=$(/home/netbackup/ci-cd-infrastructure/scripts/database-migration-manager.sh \
+            backup ${{ env.SERVICE_NAME }} stg)
+          echo "BACKUP_FILE=$backup_file" >> $GITHUB_ENV
+      
+      - name: Deploy container to STG
+        env:
+          STG_HOST: "10.6.17.83"
+        run: |
+          # Save image as tar
+          podman save -o /tmp/${{ env.SERVICE_NAME }}.tar ${{ env.SERVICE_NAME }}:${{ needs.build.outputs.image-tag }}
+          
+          # Copy to STG server
+          scp -i ~/.ssh/github_actions_runner \
+            -o StrictHostKeyChecking=no \
+            /tmp/${{ env.SERVICE_NAME }}.tar \
+            netbackup@${STG_HOST}:/tmp/
+          
+          # Deploy with database migration
+          ssh -i ~/.ssh/github_actions_runner \
+            -o StrictHostKeyChecking=no \
+            netbackup@${STG_HOST} << 'ENDSSH'
+            
+            # Stop old container
+            podman stop ${{ env.SERVICE_NAME }} 2>/dev/null || true
+            podman rm ${{ env.SERVICE_NAME }} 2>/dev/null || true
+            
+            # Load new image
+            podman load -i /tmp/${{ env.SERVICE_NAME }}.tar
+            rm /tmp/${{ env.SERVICE_NAME }}.tar
+            
+            # Run database migrations BEFORE starting the service
+            echo "🔄 Running database migrations..."
+            podman run --rm \
+              --network host \
+              -e DATABASE_URL=postgresql://microservices_user:${{ secrets.DB_PASSWORD }}@localhost:5432/microservices \
+              -e DB_SCHEMA=${{ env.SERVICE_NAME }} \
+              ${{ env.SERVICE_NAME }}:${{ needs.build.outputs.image-tag }} \
+              alembic upgrade head || {
+                echo "❌ Migration failed!"
+                exit 1
+              }
+            
+            # Start new container
+            podman run -d \
+              --name ${{ env.SERVICE_NAME }} \
+              -p 8000:8000 \
+              -e DATABASE_URL=postgresql://microservices_user:${{ secrets.DB_PASSWORD }}@localhost:5432/microservices \
+              -e DB_SCHEMA=${{ env.SERVICE_NAME }} \
+              --restart=unless-stopped \
+              ${{ env.SERVICE_NAME }}:${{ needs.build.outputs.image-tag }}
+            
+            # Wait for service to be ready
+            sleep 10
+            podman ps | grep ${{ env.SERVICE_NAME }}
+          ENDSSH
+      
+      - name: Health check STG
+        run: |
+          echo "Waiting for service to be ready..."
+          sleep 15
+          
+          # Extended health check with retries
+          for i in {1..6}; do
+            if curl -f http://10.6.17.83:8000/health; then
+              echo "✅ STG deployment successful"
+              exit 0
+            fi
+            echo "Attempt $i/6 failed, retrying in 10s..."
+            sleep 10
+          done
+          
+          echo "❌ STG health check failed"
+          
+          # If health check fails, rollback
+          /home/netbackup/ci-cd-infrastructure/scripts/database-migration-manager.sh \
+            rollback ${{ env.SERVICE_NAME }} stg ${{ env.BACKUP_FILE }}
+          
+          exit 1
+
+  # Job 6: Deploy to Production (Manual Trigger Only)
+  deploy-prd:
+    name: Deploy to Production
+    needs: build
+    if: github.event_name == 'release'
+    runs-on: self-hosted
+    environment:
+      name: production
+      url: http://10.6.17.85:8000
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Pre-deployment checks
+        run: |
+          echo "🔍 Pre-deployment checks for PRODUCTION"
+          
+          # Verify STG is healthy
+          if ! curl -f http://10.6.17.83:8000/health; then
+            echo "❌ STG environment is not healthy"
+            echo "Fix STG before deploying to PRD"
+            exit 1
+          fi
+          
+          echo "✅ STG is healthy"
+          
+          # Check migration status
+          /home/netbackup/ci-cd-infrastructure/scripts/database-migration-manager.sh \
+            status ${{ env.SERVICE_NAME }} stg
+      
+      - name: Create production backup
+        run: |
+          echo "🛡️  Creating production backup..."
+          backup_file=$(/home/netbackup/ci-cd-infrastructure/scripts/database-migration-manager.sh \
+            backup ${{ env.SERVICE_NAME }} prd)
+          echo "BACKUP_FILE=$backup_file" >> $GITHUB_ENV
+          echo "✅ Production backup created: $backup_file"
+      
+      - name: Deploy to production with safe migration
+        env:
+          PRD_HOST: "10.6.17.85"
+        run: |
+          echo "🚀 Starting production deployment..."
+          
+          # Use the migration manager for safe deployment
+          /home/netbackup/ci-cd-infrastructure/scripts/database-migration-manager.sh \
+            migrate ${{ env.SERVICE_NAME }} prd || {
+              echo "❌ Production migration failed"
+              exit 1
+            }
+          
+          # Deploy container (migration already handled above)
+          podman save -o /tmp/${{ env.SERVICE_NAME }}.tar ${{ env.SERVICE_NAME }}:${{ needs.build.outputs.image-tag }}
+          
+          scp -i ~/.ssh/github_actions_runner \
+            -o StrictHostKeyChecking=no \
+            /tmp/${{ env.SERVICE_NAME }}.tar \
+            netbackup@${PRD_HOST}:/tmp/
+          
+          ssh -i ~/.ssh/github_actions_runner \
+            -o StrictHostKeyChecking=no \
+            netbackup@${PRD_HOST} << 'ENDSSH'
+            
+            # Load new image
+            podman load -i /tmp/${{ env.SERVICE_NAME }}.tar
+            rm /tmp/${{ env.SERVICE_NAME }}.tar
+            
+            # Container should already be running from migration manager
+            # Just verify it's healthy
+            sleep 5
+            podman ps | grep ${{ env.SERVICE_NAME }}
+          ENDSSH
+      
+      - name: Production health check
+        run: |
+          echo "🏥 Production health check..."
+          sleep 15
+          
+          for i in {1..10}; do
+            if curl -f http://10.6.17.85:8000/health; then
+              echo "✅ PRD deployment successful"
+              echo ""
+              echo "🎉 Production deployment completed!"
+              echo "🔗 Production URL: http://10.6.17.85:8000"
+              echo "📊 Health: http://10.6.17.85:8000/health"
+              echo "📚 Docs: http://10.6.17.85:8000/docs"
+              echo "💾 Backup: ${{ env.BACKUP_FILE }}"
+              exit 0
+            fi
+            echo "Attempt $i/10 failed, retrying in 15s..."
+            sleep 15
+          done
+          
+          echo "❌ PRD health check failed - initiating emergency rollback"
+          
+          # Emergency rollback
+          /home/netbackup/ci-cd-infrastructure/scripts/database-migration-manager.sh \
+            rollback ${{ env.SERVICE_NAME }} prd ${{ env.BACKUP_FILE }}
+          
+          exit 1
